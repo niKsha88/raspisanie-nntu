@@ -182,9 +182,8 @@ async function searchTeacher() {
         const data = await response.json();
         // Учитываем вложенную структуру {teachers: {teachers: {...}}}
         let teachersList = [];
-        if (data.teachers) {
-            if (Array.isArray(data.teachers)) teachersList = data.teachers;
-            else if (data.teachers.teachers) teachersList = Object.values(data.teachers.teachers);
+        if (data.teachers && Array.isArray(data.teachers)) {
+            teachersList = data.teachers;
         }
         if (!teachersList.length) {
             results.innerHTML = '<div class="empty-day">🤷 Никого не нашёл</div>';

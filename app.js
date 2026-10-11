@@ -2,13 +2,13 @@
 // КОНФИГУРАЦИЯ
 // ==========================================================
 const API_URL = 'https://api.nntu.ru/getschedule';
-const GROUPS_API = 'https://api.nntu.ru/getgroups';
 const WORKER_URL = 'https://nntu-teachers.vika-shilina-06-06.workers.dev';
 const GROUP_ID = '846';
 const DEPARTMENT_ID = 1;
 
 let currentTab = 'today';
 let currentSchedule = null;
+let suggestTimer = null;    // для debounce подсказок
 
 const WEEKDAYS = {1: 'Понедельник', 2: 'Вторник', 3: 'Среда', 4: 'Четверг', 5: 'Пятница', 6: 'Суббота', 7: 'Воскресенье'};
 const WEEKDAYS_FULL = {1: 'Понедельник', 2: 'Вторник', 3: 'Среда', 4: 'Четверг', 5: 'Пятница', 6: 'Суббота'};
@@ -48,6 +48,7 @@ function normalizeSchedule(raw) {
     const result = {};
     for (const [wday, streams] of Object.entries(raw)) {
         const lessons = [];
+        const seen = new Set(); // защита от дублей
         if (Array.isArray(streams)) {
             for (const stream of streams) {
                 if (!Array.isArray(stream)) continue;
@@ -55,12 +56,17 @@ function normalizeSchedule(raw) {
                     const surname = p.prepod_surname || '';
                     const name = p.prepod_name || '';
                     const initials = p.prepod_initials || '';
+                    const teacher = surname + (name ? ' ' + name[0] + '.' : '') + (initials ? initials[0] + '.' : '');
+                    // Уникальный ключ для дедупликации
+                    const key = `${p.para}_${p.predmet_name}_${p.aud}_${teacher}_${p.para_type}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
                     lessons.push({
                         number: parseInt(p.para) || 0,
                         time: p.para_time || '',
                         subject: p.predmet_name || '',
                         type: p.para_type || '',
-                        teacher: surname + (name ? ' ' + name[0] + '.' : '') + (initials ? initials[0] + '.' : ''),
+                        teacher: teacher,
                         room: p.aud || '',
                         comment: p.comment || '',
                         trueTime: p.true_time || 0,
@@ -69,7 +75,7 @@ function normalizeSchedule(raw) {
                 }
             }
         }
-        lessons.sort((a, b) => a.number - b.number);
+        lessons.sort((a, b) => a.number - b.number || a.type.localeCompare(b.type));
         result[wday] = lessons;
     }
     return result;
@@ -104,13 +110,14 @@ function renderDay(lessons, header) {
     let html = `<div class="day-header">${header}</div>`;
     for (const l of lessons) {
         const cancelClass = l.isCancelled ? ' cancelled' : '';
+        const room = l.room ? `<span>🚪 ауд. ${l.room}</span>` : '';
         html += `
             <div class="lesson-card${cancelClass}">
                 <div class="lesson-time">🕐 ${l.time} (${l.number} пара) — ${l.type}</div>
                 <div class="lesson-subject">${l.subject}</div>
                 <div class="lesson-details">
                     <span>👤 ${l.teacher}</span>
-                    <span>🚪 ауд. ${l.room}</span>
+                    ${room}
                 </div>
                 ${l.comment && !l.isCancelled ? `<div class="lesson-comment">💬 ${l.comment}</div>` : ''}
                 ${l.isCancelled ? '<div class="lesson-comment">❌ ОТМЕНА</div>' : ''}
@@ -132,28 +139,31 @@ document.querySelectorAll('.tab').forEach(tab => {
     });
 });
 
-document.getElementById('refreshBtn').addEventListener('click', () => {
-    loadSchedule();
-});
-
+document.getElementById('refreshBtn').addEventListener('click', loadSchedule);
 document.getElementById('settingsBtn').addEventListener('click', () => {
-    alert('⚙️ Настройки\n\nЗдесь можно будет:\n• Сменить группу\n• Настроить время уведомлений\n• Включить/выключить push\n\n(В разработке)');
+    alert('⚙️ Настройки\n\nЗдесь можно будет:\n• Сменить группу\n• Настроить уведомления\n• Включить push\n\n(В разработке)');
 });
-
 document.getElementById('teacherBtn').addEventListener('click', showTeacherSearch);
 
 // ==========================================================
-// ПОИСК ПРЕПОДАВАТЕЛЯ
+// ПОИСК ПРЕПОДАВАТЕЛЯ + АВТОДОПОЛНЕНИЕ
 // ==========================================================
 function showTeacherSearch() {
     const content = document.getElementById('scheduleContent');
     content.innerHTML = `
         <div class="day-header">👨‍🏫 Расписание преподавателя</div>
-        <div style="padding: 12px 0;">
-            <input type="text" id="teacherQuery" placeholder="Введите фамилию..." 
+        <div style="padding: 12px 0; position: relative;">
+            <input type="text" id="teacherQuery" placeholder="Начните вводить фамилию..." 
+                   autocomplete="off"
                    style="width: 100%; padding: 12px; border-radius: 8px; 
                           border: 1px solid #2a2a4a; background: #16213e; 
                           color: #eaeaea; font-size: 16px; box-sizing: border-box;">
+            <div id="teacherSuggestions" 
+                 style="position: absolute; left: 0; right: 0; top: 100%; 
+                        background: #16213e; border: 1px solid #2a2a4a; 
+                        border-radius: 8px; margin-top: 4px; max-height: 240px; 
+                        overflow-y: auto; z-index: 100; display: none;">
+            </div>
             <button id="teacherSearchBtn" 
                     style="margin-top: 10px; width: 100%; padding: 12px; 
                            border-radius: 8px; border: none; background: #0f3460; 
@@ -163,15 +173,78 @@ function showTeacherSearch() {
         </div>
         <div id="teacherResults"></div>
     `;
-    document.getElementById('teacherSearchBtn').addEventListener('click', searchTeacher);
-    document.getElementById('teacherQuery').addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') searchTeacher();
+
+    const input = document.getElementById('teacherQuery');
+    const suggestions = document.getElementById('teacherSuggestions');
+
+    // Автоподсказки при вводе (с задержкой 250 мс)
+    input.addEventListener('input', () => {
+        clearTimeout(suggestTimer);
+        const q = input.value.trim();
+        if (q.length < 1) {
+            suggestions.style.display = 'none';
+            suggestions.innerHTML = '';
+            return;
+        }
+        suggestTimer = setTimeout(() => fetchSuggestions(q), 250);
     });
+
+    // Скрываем подсказки при клике вне
+    document.addEventListener('click', (e) => {
+        if (!suggestions.contains(e.target) && e.target !== input) {
+            suggestions.style.display = 'none';
+        }
+    });
+
+    document.getElementById('teacherSearchBtn').addEventListener('click', searchTeacher);
+    input.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            suggestions.style.display = 'none';
+            searchTeacher();
+        }
+    });
+}
+
+// Получить подсказки для автодополнения
+async function fetchSuggestions(query) {
+    const suggestions = document.getElementById('teacherSuggestions');
+    try {
+        const response = await fetch(`${WORKER_URL}/teacher?name=${encodeURIComponent(query)}`);
+        const data = await response.json();
+        const teachers = (data.teachers || []).slice(0, 15);
+        if (teachers.length === 0) {
+            suggestions.style.display = 'none';
+            return;
+        }
+        suggestions.innerHTML = teachers.map(t => `
+            <div class="suggestion-item" 
+                 data-name="${t.display.replace(/"/g, '&quot;')}"
+                 style="padding: 10px 12px; cursor: pointer; 
+                        border-bottom: 1px solid #2a2a4a; color: #eaeaea;">
+                <div style="font-size: 15px;">${t.display}</div>
+                <div style="font-size: 12px; color: #a0a0b0;">${t.position || ''}</div>
+            </div>
+        `).join('');
+        suggestions.style.display = 'block';
+
+        // Клик по подсказке — сразу показываем расписание
+        suggestions.querySelectorAll('.suggestion-item').forEach(el => {
+            el.addEventListener('click', () => {
+                document.getElementById('teacherQuery').value = el.dataset.name;
+                suggestions.style.display = 'none';
+                searchTeacher();
+            });
+        });
+    } catch (e) {
+        console.error('Suggest error:', e);
+    }
 }
 
 async function searchTeacher() {
     const query = document.getElementById('teacherQuery').value.trim();
     const results = document.getElementById('teacherResults');
+    document.getElementById('teacherSuggestions').style.display = 'none';
+
     if (query.length < 2) {
         results.innerHTML = '<div class="empty-day">Введите минимум 2 буквы</div>';
         return;
@@ -180,11 +253,7 @@ async function searchTeacher() {
     try {
         const response = await fetch(`${WORKER_URL}/teacher?name=${encodeURIComponent(query)}`);
         const data = await response.json();
-        // Учитываем вложенную структуру {teachers: {teachers: {...}}}
-        let teachersList = [];
-        if (data.teachers && Array.isArray(data.teachers)) {
-            teachersList = data.teachers;
-        }
+        const teachersList = Array.isArray(data.teachers) ? data.teachers : [];
         if (!teachersList.length) {
             results.innerHTML = '<div class="empty-day">🤷 Никого не нашёл</div>';
             return;
@@ -210,19 +279,31 @@ async function searchTeacher() {
     }
 }
 
+// ==========================================================
+// РАСПИСАНИЕ ПРЕПОДАВАТЕЛЯ С ОБЪЕДИНЕНИЕМ ГРУПП
+// ==========================================================
 window.showTeacherSchedule = function(key) {
     const t = (window._lastTeachers || []).find(x => x.key === key);
     if (!t) return;
     const content = document.getElementById('scheduleContent');
-    
-    // Собираем расписание: если lessons уже пришли — используем их
-    let lessons = t.lessons || [];
-    
+
+    // 🔑 Объединяем группы: ключ = (wday, para, subject, type, room, comment)
+    const merged = {};
+    for (const l of (t.lessons || [])) {
+        const k = `${l.wday}_${l.para}_${l.subject}_${l.type}_${l.room}_${l.comment}`;
+        if (!merged[k]) {
+            merged[k] = { ...l, groups: [l.group] };
+        } else {
+            if (!merged[k].groups.includes(l.group)) {
+                merged[k].groups.push(l.group);
+            }
+        }
+    }
+
     // Группируем по дням
     const byDay = {1: [], 2: [], 3: [], 4: [], 5: [], 6: []};
-    for (const l of lessons) {
-        const wday = l.wday || 0;
-        if (byDay[wday]) byDay[wday].push(l);
+    for (const m of Object.values(merged)) {
+        if (byDay[m.wday]) byDay[m.wday].push(m);
     }
     for (const d of Object.keys(byDay)) {
         byDay[d].sort((a, b) => (a.para || 0) - (b.para || 0));
@@ -240,19 +321,21 @@ window.showTeacherSchedule = function(key) {
 
     let hasLessons = false;
     for (const wday of [1, 2, 3, 4, 5, 6]) {
-        const dayLessons = byDay[wday];
-        if (dayLessons.length === 0) continue;
+        const lessons = byDay[wday];
+        if (lessons.length === 0) continue;
         hasLessons = true;
         html += `<div class="day-header" style="font-size: 16px; margin-top: 16px;">${WEEKDAYS_FULL[wday]}</div>`;
-        for (const l of dayLessons) {
+        for (const l of lessons) {
             const cancelClass = l.isCancelled ? ' cancelled' : '';
+            const groupsStr = l.groups.join(' / ');
+            const room = l.room ? `<span>🚪 ауд. ${l.room}</span>` : '';
             html += `
                 <div class="lesson-card${cancelClass}">
                     <div class="lesson-time">🕐 ${l.time} (${l.para} пара) — ${l.type}</div>
                     <div class="lesson-subject">${l.subject}</div>
                     <div class="lesson-details">
-                        <span>👥 ${l.group || '—'}</span>
-                        <span>🚪 ауд. ${l.room}</span>
+                        <span>👥 ${groupsStr}</span>
+                        ${room}
                     </div>
                     ${l.comment && !l.isCancelled ? `<div class="lesson-comment">💬 ${l.comment}</div>` : ''}
                     ${l.isCancelled ? '<div class="lesson-comment">❌ ОТМЕНА</div>' : ''}

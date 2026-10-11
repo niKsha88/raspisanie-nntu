@@ -1,16 +1,18 @@
 // Конфигурация
 const API_URL = 'https://api.nntu.ru/getschedule';
-const GROUP_ID = '846'; // ID группы АСИ 24-1 (нужно уточнить в API)
+const GROUP_ID = '846';
 const DEPARTMENT_ID = 1;
 
 let currentTab = 'today';
 let currentSchedule = null;
 
-// Дни недели
 const WEEKDAYS = {1: 'Понедельник', 2: 'Вторник', 3: 'Среда', 4: 'Четверг', 5: 'Пятница', 6: 'Суббота', 7: 'Воскресенье'};
 
 // Загрузка расписания с API
 async function loadSchedule() {
+    const content = document.getElementById('scheduleContent');
+    content.innerHTML = '<div class="loading">Загрузка расписания...</div>';
+    
     try {
         const response = await fetch(API_URL, {
             method: 'POST',
@@ -23,7 +25,6 @@ async function loadSchedule() {
         const raw = await response.json();
         currentSchedule = normalizeSchedule(raw);
         
-        // Сохраняем в localStorage для офлайн-режима
         localStorage.setItem('schedule_cache', JSON.stringify({
             data: currentSchedule,
             timestamp: Date.now()
@@ -32,24 +33,18 @@ async function loadSchedule() {
         render();
     } catch (error) {
         console.error('Ошибка загрузки:', error);
-        
-        // Пробуем взять из кэша
         const cached = localStorage.getItem('schedule_cache');
         if (cached) {
             currentSchedule = JSON.parse(cached).data;
             render();
-            showNotification('Показано сохранённое расписание (нет сети)');
         } else {
-            document.getElementById('scheduleContent').innerHTML = 
-                '<div class="empty-day">❌ Не удалось загрузить расписание. Проверьте интернет.</div>';
+            content.innerHTML = '<div class="empty-day">❌ Не удалось загрузить расписание. Проверьте интернет.</div>';
         }
     }
 }
 
-// Преобразование ответа API
 function normalizeSchedule(raw) {
     const result = {};
-    
     for (const [wday, streams] of Object.entries(raw)) {
         const lessons = [];
         if (Array.isArray(streams)) {
@@ -59,7 +54,6 @@ function normalizeSchedule(raw) {
                     const surname = p.prepod_surname || '';
                     const name = p.prepod_name || '';
                     const initials = p.prepod_initials || '';
-                    
                     lessons.push({
                         number: parseInt(p.para) || 0,
                         time: p.para_time || '',
@@ -77,14 +71,11 @@ function normalizeSchedule(raw) {
         lessons.sort((a, b) => a.number - b.number);
         result[wday] = lessons;
     }
-    
     return result;
 }
 
-// Рендер
 function render() {
     const content = document.getElementById('scheduleContent');
-    
     if (!currentSchedule) {
         content.innerHTML = '<div class="loading">Загрузка...</div>';
         return;
@@ -95,10 +86,8 @@ function render() {
         const wday = targetDate.getDay() === 0 ? 7 : targetDate.getDay();
         const lessons = currentSchedule[wday] || [];
         const title = currentTab === 'today' ? 'Сегодня' : 'Завтра';
-        
         content.innerHTML = renderDay(lessons, `${title}, ${targetDate.toLocaleDateString('ru-RU')} (${WEEKDAYS[wday] || ''})`);
     } else {
-        // Неделя
         let html = '';
         for (let wday = 1; wday <= 6; wday++) {
             const lessons = currentSchedule[wday] || [];
@@ -110,13 +99,11 @@ function render() {
     }
 }
 
-function renderDay(lessons, header, compact = false) {
+function renderDay(lessons, header) {
     if (!lessons || lessons.length === 0) {
-        return `<div class="empty-day">🎉 Пар нет!</div>`;
+        return `<div class="day-header">${header}</div><div class="empty-day">🎉 Пар нет!</div>`;
     }
-    
     let html = `<div class="day-header">${header}</div>`;
-    
     for (const l of lessons) {
         const cancelClass = l.isCancelled ? ' cancelled' : '';
         html += `
@@ -132,11 +119,14 @@ function renderDay(lessons, header, compact = false) {
             </div>
         `;
     }
-    
     return html;
 }
 
-// Переключение вкладок
+// ==========================================================
+// ОБРАБОТЧИКИ КНОПОК
+// ==========================================================
+
+// Вкладки
 document.querySelectorAll('.tab').forEach(tab => {
     tab.addEventListener('click', () => {
         document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -146,14 +136,25 @@ document.querySelectorAll('.tab').forEach(tab => {
     });
 });
 
-// Обновление
-document.getElementById('refreshBtn').addEventListener('click', loadSchedule);
+// Кнопка "Обновить"
+document.getElementById('refreshBtn').addEventListener('click', () => {
+    loadSchedule();
+});
 
-// Уведомление
-function showNotification(text) {
-    // Можно расширить для push-уведомлений
-    console.log(text);
-}
+// Кнопка "Настройки"
+document.getElementById('settingsBtn').addEventListener('click', () => {
+    alert('⚙️ Настройки\n\nЗдесь можно будет:\n• Сменить группу\n• Настроить время уведомлений\n• Включить/выключить push\n\n(В разработке)');
+});
 
-// Запуск
+// Кнопка "Преподаватели"
+document.getElementById('teacherBtn').addEventListener('click', () => {
+    const query = prompt('🔍 Введите фамилию преподавателя:');
+    if (query && query.length >= 3) {
+        alert(`Поиск преподавателя "${query}" — в разработке.\n\nСкоро здесь будет расписание преподавателя.`);
+    }
+});
+
+// ==========================================================
+// ЗАПУСК
+// ==========================================================
 loadSchedule();
